@@ -26,6 +26,10 @@ WHISPER_MODEL = os.environ.get(
     "YTNOTE_WHISPER_MODEL",
     str(Path.home() / ".local/share/whisper/models/ggml-large-v3-turbo.bin"),
 )
+PARAKEET_MODEL = os.environ.get(
+    "YTNOTE_PARAKEET_MODEL",
+    str(Path.home() / ".local/share/whisper/models/ggml-parakeet-tdt-0.6b-v3-f16.bin"),
+)
 
 
 def die(msg, code=1):
@@ -85,12 +89,30 @@ def fetch_subs(url, scratch, lang):
     return None, None
 
 
+LIB_ENV = {**os.environ, "LD_LIBRARY_PATH":
+           str(Path.home() / ".local/lib") + ":" + os.environ.get("LD_LIBRARY_PATH", "")}
+
+
 def transcribe_whisper(url, scratch, lang, model):
-    need("ffmpeg")
     need("whisper")
     if not Path(model).exists():
         die(f"whisper model not found: {model}")
-    info("no subtitles — downloading audio for whisper...")
+    wav16 = _audio16(url, scratch)
+    info("transcribing with whisper.cpp (this can take a while)...")
+    p = run(
+        ["whisper", "-m", model, "-f", str(wav16), "-l", lang, "-ovtt",
+         "-of", str(scratch / "whisper")],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        die(f"whisper failed\n{p.stderr.strip()}")
+    return parse_vtt(scratch / "whisper.vtt"), "whisper"
+
+
+def _audio16(url, scratch):
+    """Download audio and resample to 16kHz mono wav. Returns the wav path."""
+    need("ffmpeg")
+    info("no subtitles — downloading audio...")
     p = run(
         ["yt-dlp", "--no-warnings", "-x", "--audio-format", "wav",
          "-o", str(scratch / "audio.%(ext)s"), url],
@@ -103,16 +125,60 @@ def transcribe_whisper(url, scratch, lang, model):
     info("resampling to 16kHz mono...")
     run(["ffmpeg", "-y", "-i", str(raw), "-ar", "16000", "-ac", "1", str(wav16)],
         capture_output=True)
-    info("transcribing with whisper.cpp (this can take a while)...")
-    out = scratch / "whisper"
-    p = run(
-        ["whisper", "-m", model, "-f", str(wav16), "-l", lang, "-ovtt",
-         "-of", str(out)],
-        capture_output=True, text=True,
-    )
+    return wav16
+
+
+# Parakeet token line, e.g.:  [ 0] id= 5831 ... t0= 416 ... word_start=true "▁This"
+PK_TOK = re.compile(r'^\s*\[\s*\d+\]\s+id=.*?\bt0=\s*(\d+)\b.*?word_start=(true|false)\s+"(.*)"\s*$')
+
+
+def _parakeet_cues(stderr_text, max_words=14):
+    """Parse parakeet-cli --print-segments token lines into [(start_sec, text)] cues.
+    Tokens carry t0 in 10ms mel frames; ▁ marks a word boundary."""
+    words, cur, cur_t = [], "", None
+    for line in stderr_text.splitlines():
+        m = PK_TOK.match(line)
+        if not m:
+            continue
+        t0 = int(m.group(1)) * 0.01
+        raw = m.group(3)
+        if m.group(2) == "true" and raw.startswith("▁"):
+            if cur.strip():
+                words.append((cur_t, cur.strip()))
+            cur, cur_t = raw.replace("▁", " "), t0
+        else:
+            cur_t = t0 if cur_t is None else cur_t
+            cur += raw.replace("▁", " ")
+    if cur.strip():
+        words.append((cur_t, cur.strip()))
+
+    cues, buf, t0 = [], [], None
+    for t, w in words:
+        if not buf:
+            t0 = t
+        buf.append(w)
+        if w.endswith((".", "?", "!")) or len(buf) >= max_words:
+            cues.append((t0, " ".join(buf)))
+            buf = []
+    if buf:
+        cues.append((t0, " ".join(buf)))
+    return cues
+
+
+def transcribe_parakeet(url, scratch, model):
+    need("parakeet-cli")
+    if not Path(model).exists():
+        die(f"parakeet model not found: {model}")
+    wav16 = _audio16(url, scratch)
+    info("transcribing with parakeet (English)...")
+    p = run(["parakeet-cli", "-m", model, "-f", str(wav16), "--print-segments"],
+            capture_output=True, text=True, env=LIB_ENV)
     if p.returncode != 0:
-        die(f"whisper failed\n{p.stderr.strip()}")
-    return scratch / "whisper.vtt", "whisper"
+        die(f"parakeet failed\n{p.stderr.strip()}")
+    cues = _parakeet_cues(p.stderr)
+    if not cues:
+        die("parakeet produced no tokens")
+    return cues, "parakeet"
 
 
 # ── vtt parsing ─────────────────────────────────────────────────────────────────
@@ -158,6 +224,7 @@ def parse_vtt(path):
 
 
 def hms(sec):
+    sec = int(sec)
     return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
 
 
@@ -235,9 +302,12 @@ def main():
                     help="output dir (default: $YTNOTE_DIR or cwd)")
     ap.add_argument("--lang", default="en", help="transcript language (default: en)")
     ap.add_argument("--no-notes", action="store_true", help="transcript only, skip claude")
+    ap.add_argument("--parakeet", action="store_true",
+                    help="force local Parakeet transcription, ignore YouTube subtitles")
     ap.add_argument("--whisper", action="store_true",
-                    help="force whisper, ignore YouTube subtitles")
-    ap.add_argument("--model", default=WHISPER_MODEL, help="whisper.cpp model path")
+                    help="use whisper.cpp instead of Parakeet for local transcription")
+    ap.add_argument("--model", default=None,
+                    help="override the local model path (whisper or parakeet)")
     args = ap.parse_args()
 
     need("yt-dlp")
@@ -247,13 +317,19 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix=f"ytnote-{meta['id']}-") as tmp:
         scratch = Path(tmp)
-        vtt, source = (None, None)
-        if not args.whisper:
+        cues, source = None, None
+        force_local = args.whisper or args.parakeet
+        if not force_local:
             vtt, source = fetch_subs(meta["url"], scratch, args.lang)
-        if vtt is None:
-            vtt, source = transcribe_whisper(meta["url"], scratch, args.lang, args.model)
-
-        cues = parse_vtt(vtt)
+            if vtt is not None:
+                cues = parse_vtt(vtt)
+        if cues is None:
+            if args.whisper:
+                cues, source = transcribe_whisper(
+                    meta["url"], scratch, args.lang, args.model or WHISPER_MODEL)
+            else:
+                cues, source = transcribe_parakeet(
+                    meta["url"], scratch, args.model or PARAKEET_MODEL)
         if not cues:
             die("transcript came back empty")
         transcript = render_transcript(cues)

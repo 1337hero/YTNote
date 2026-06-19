@@ -11,10 +11,14 @@ editor.
 
 ```
 url ─▶ yt-dlp metadata
-    ─▶ transcript   (YouTube subtitles first, whisper.cpp fallback)
+    ─▶ transcript   (YouTube subtitles first; local fallback: Parakeet, or whisper.cpp)
     ─▶ clean [HH:MM:SS] markdown
     ─▶ research notes via the `claude` CLI   (skip with --no-notes)
 ```
+
+For caption-less videos the local fallback defaults to **NVIDIA Parakeet-TDT** (English,
+via whisper.cpp's parakeet-cli) — on an AMD R9700 it benched faster and more accurate than
+whisper large-v3-turbo. Pass `--whisper` to use whisper.cpp instead (multilingual).
 
 Each file has YAML frontmatter (id, title, channel, url, duration, transcript source) followed
 by a `## Notes` section (TL;DR, key points, timestamped notable moments, terms/references) and a
@@ -25,10 +29,11 @@ de-duplicated `## Transcript`.
 | tool | why | required? |
 |------|-----|-----------|
 | [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) | metadata, subtitle + audio download | **yes** |
-| [`ffmpeg`](https://ffmpeg.org/) | resample audio for whisper | yes (only used on the whisper path) |
+| [`ffmpeg`](https://ffmpeg.org/) | resample audio for local transcription | yes (only on the local-fallback path) |
 | `python3` (3.8+) | the CLI itself — standard library only, no pip installs | **yes** |
 | [`claude`](https://docs.claude.com/en/docs/claude-code) CLI | generates the notes | only if you want notes (omit with `--no-notes`) |
-| [`whisper`](https://github.com/ggml-org/whisper.cpp) (whisper.cpp) + a ggml model | transcribe videos that have no captions | only for the fallback path |
+| [`parakeet-cli`](https://github.com/ggml-org/whisper.cpp) + a Parakeet ggml model | local fallback for caption-less videos (English, default) | only for the fallback path |
+| [`whisper`](https://github.com/ggml-org/whisper.cpp) (whisper.cpp) + a ggml model | local fallback alternative (`--whisper`, multilingual) | only if you use `--whisper` |
 
 If a video has YouTube captions and you pass `--no-notes`, you need just `yt-dlp` + `python3`.
 
@@ -60,9 +65,10 @@ source /path/to/ytnote/ytnote.zsh
 ```sh
 ytnote "https://www.youtube.com/watch?v=VIDEO_ID"   # transcript + notes -> ./slug-id.md
 ytnote --no-notes URL                               # transcript only (fast, no claude)
-ytnote --whisper URL                                # force whisper, ignore YT captions
+ytnote --parakeet URL                               # force local Parakeet, ignore captions
+ytnote --whisper URL                                # local fallback via whisper.cpp instead
 ytnote --dir ~/research URL                         # write into a library dir
-ytnote --lang es URL                                # non-English transcript
+ytnote --lang es URL                                # non-English (subtitles / whisper)
 ```
 
 ### Options
@@ -72,12 +78,14 @@ ytnote --lang es URL                                # non-English transcript
 | `--dir DIR`    | `$YTNOTE_DIR` or cwd | output directory |
 | `--lang LANG`  | `en` | subtitle / whisper language |
 | `--no-notes`   | off  | transcript only, skip claude |
-| `--whisper`    | off  | force local transcription, ignore captions |
-| `--model PATH` | `$YTNOTE_WHISPER_MODEL` or `ggml-large-v3-turbo` | whisper.cpp model |
+| `--parakeet`   | off  | force local Parakeet transcription, ignore captions |
+| `--whisper`    | off  | use whisper.cpp (not Parakeet) for local transcription |
+| `--model PATH` | per-engine default | override the local model path |
 
 ### Environment
 
 - `YTNOTE_DIR` — default output directory (point it at your notes library).
+- `YTNOTE_PARAKEET_MODEL` — default Parakeet model path.
 - `YTNOTE_WHISPER_MODEL` — default whisper.cpp model path.
 
 ## Output shape
