@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+ytnote — turn a YouTube video into a timestamped transcript + AI research notes.
+
+Pipeline:
+  url -> yt-dlp metadata
+      -> transcript (yt-dlp subtitles first, whisper.cpp fallback)
+      -> clean [HH:MM:SS] markdown
+      -> (optional) research notes via the `claude` CLI
+
+Zero third-party deps. Needs on PATH: yt-dlp, ffmpeg, and (for fallback) whisper, claude.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import date
+from pathlib import Path
+
+WHISPER_MODEL = os.environ.get(
+    "YTNOTE_WHISPER_MODEL",
+    str(Path.home() / ".local/share/whisper/models/ggml-large-v3-turbo.bin"),
+)
+
+
+def die(msg, code=1):
+    print(f"ytnote: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"ytnote: {msg}", file=sys.stderr)
+
+
+def need(tool):
+    if not shutil.which(tool):
+        die(f"`{tool}` not found on PATH")
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, **kw)
+
+
+# ── metadata ──────────────────────────────────────────────────────────────────
+def fetch_meta(url):
+    info("fetching video metadata...")
+    p = run(
+        ["yt-dlp", "-J", "--no-warnings", "--skip-download", url],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        die(f"yt-dlp could not read the URL\n{p.stderr.strip()}")
+    d = json.loads(p.stdout)
+    return {
+        "id": d["id"],
+        "title": d.get("title", d["id"]),
+        "channel": d.get("uploader") or d.get("channel") or "",
+        "duration": int(d.get("duration") or 0),
+        "url": d.get("webpage_url", url),
+    }
+
+
+# ── transcript sources ─────────────────────────────────────────────────────────
+def fetch_subs(url, scratch, lang):
+    """Try manual subs, then auto-captions. Returns (vtt_path, kind) or (None, None)."""
+    for auto, kind in ((False, "subtitles"), (True, "auto-captions")):
+        for f in scratch.glob("*.vtt"):
+            f.unlink()
+        cmd = [
+            "yt-dlp", "--no-warnings", "--skip-download",
+            "--sub-langs", f"{lang}.*,{lang}", "--sub-format", "vtt",
+            "--write-auto-subs" if auto else "--write-subs",
+            "-o", str(scratch / "%(id)s"), url,
+        ]
+        run(cmd, capture_output=True, text=True)
+        vtts = sorted(scratch.glob("*.vtt"))
+        if vtts:
+            info(f"using {kind}: {vtts[0].name}")
+            return vtts[0], kind
+    return None, None
+
+
+def transcribe_whisper(url, scratch, lang, model):
+    need("ffmpeg")
+    need("whisper")
+    if not Path(model).exists():
+        die(f"whisper model not found: {model}")
+    info("no subtitles — downloading audio for whisper...")
+    p = run(
+        ["yt-dlp", "--no-warnings", "-x", "--audio-format", "wav",
+         "-o", str(scratch / "audio.%(ext)s"), url],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        die(f"audio download failed\n{p.stderr.strip()}")
+    raw = next(scratch.glob("audio.*"))
+    wav16 = scratch / "audio16.wav"
+    info("resampling to 16kHz mono...")
+    run(["ffmpeg", "-y", "-i", str(raw), "-ar", "16000", "-ac", "1", str(wav16)],
+        capture_output=True)
+    info("transcribing with whisper.cpp (this can take a while)...")
+    out = scratch / "whisper"
+    p = run(
+        ["whisper", "-m", model, "-f", str(wav16), "-l", lang, "-ovtt",
+         "-of", str(out)],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        die(f"whisper failed\n{p.stderr.strip()}")
+    return scratch / "whisper.vtt", "whisper"
+
+
+# ── vtt parsing ─────────────────────────────────────────────────────────────────
+TS = re.compile(r"(\d{2}):(\d{2}):(\d{2})\.\d{3}\s+-->\s+(\d{2}):(\d{2}):(\d{2})")
+TAG = re.compile(r"<[^>]+>")
+
+
+def _secs(h, m, s):
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
+def parse_vtt(path):
+    """Parse VTT into [(start_seconds, text)], collapsing rolling auto-caption dupes."""
+    cues = []
+    start = None
+    buf = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = TS.match(line.strip())
+        if m:
+            if start is not None and buf:
+                cues.append((start, " ".join(buf)))
+            start = _secs(*m.groups()[:3])
+            buf = []
+        elif start is not None and line.strip() and "-->" not in line:
+            txt = TAG.sub("", line).replace("&nbsp;", " ")
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if txt:
+                buf.append(txt)
+    if start is not None and buf:
+        cues.append((start, " ".join(buf)))
+
+    out = []
+    for t, txt in cues:
+        if out:
+            prev = out[-1][1]
+            if txt == prev or txt in prev:
+                continue
+            if prev in txt:               # rolling caption grew — replace
+                out[-1] = (out[-1][0], txt)
+                continue
+        out.append((t, txt))
+    return out
+
+
+def hms(sec):
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+def render_transcript(cues):
+    return "\n".join(f"[{hms(t)}] {txt}" for t, txt in cues)
+
+
+# ── notes ───────────────────────────────────────────────────────────────────────
+NOTE_PROMPT = """You are taking research notes on a YouTube talk for someone who wants \
+the substance without rewatching. Below is a timestamped transcript.
+
+Write notes as clean Markdown with these sections:
+- **TL;DR** — 2-3 sentences.
+- **Key points** — bulleted, the actual claims/arguments made.
+- **Notable moments** — a few bullets, each prefixed with its [HH:MM:SS] timestamp.
+- **Terms & references** — people, tools, papers, or concepts named (skip if none).
+- **Open questions / what's unresolved** — skip if none.
+
+Ground every note in the transcript; do not invent claims. Be concise. \
+Do not use em dashes or arrow characters. Output only the Markdown notes, no preamble."""
+
+
+def make_notes(transcript):
+    need("claude")
+    info("generating notes with claude...")
+    p = run(["claude", "-p", NOTE_PROMPT], input=transcript,
+            capture_output=True, text=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        info(f"claude failed; skipping notes\n{p.stderr.strip()}")
+        return None
+    return p.stdout.strip()
+
+
+# ── assembly ────────────────────────────────────────────────────────────────────
+def slugify(s):
+    s = re.sub(r"[^\w\s-]", "", s.lower()).strip()
+    return re.sub(r"[\s_-]+", "-", s)[:60] or "video"
+
+
+def yaml_escape(s):
+    return '"' + str(s).replace('"', '\\"') + '"'
+
+
+def build_md(meta, source, transcript, notes):
+    fm = [
+        "---",
+        f"id: {meta['id']}",
+        f"title: {yaml_escape(meta['title'])}",
+        f"channel: {yaml_escape(meta['channel'])}",
+        f"url: {meta['url']}",
+        f"duration: {hms(meta['duration'])}",
+        f"transcript_source: {source}",
+        f"created: '{date.today().isoformat()}'",
+        "---",
+        "",
+        f"# {meta['title']}",
+        "",
+        f"{meta['channel']}  ·  {meta['url']}",
+        "",
+    ]
+    body = []
+    if notes:
+        body += ["## Notes", "", notes, ""]
+    body += ["## Transcript", "", transcript, ""]
+    return "\n".join(fm + body)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ytnote",
+        description="YouTube -> timestamped transcript + AI research notes.",
+    )
+    ap.add_argument("url", help="YouTube URL or video id")
+    ap.add_argument("--dir", default=os.environ.get("YTNOTE_DIR", os.getcwd()),
+                    help="output dir (default: $YTNOTE_DIR or cwd)")
+    ap.add_argument("--lang", default="en", help="transcript language (default: en)")
+    ap.add_argument("--no-notes", action="store_true", help="transcript only, skip claude")
+    ap.add_argument("--whisper", action="store_true",
+                    help="force whisper, ignore YouTube subtitles")
+    ap.add_argument("--model", default=WHISPER_MODEL, help="whisper.cpp model path")
+    args = ap.parse_args()
+
+    need("yt-dlp")
+    meta = fetch_meta(args.url)
+    outdir = Path(args.dir).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=f"ytnote-{meta['id']}-") as tmp:
+        scratch = Path(tmp)
+        vtt, source = (None, None)
+        if not args.whisper:
+            vtt, source = fetch_subs(meta["url"], scratch, args.lang)
+        if vtt is None:
+            vtt, source = transcribe_whisper(meta["url"], scratch, args.lang, args.model)
+
+        cues = parse_vtt(vtt)
+        if not cues:
+            die("transcript came back empty")
+        transcript = render_transcript(cues)
+
+    notes = None if args.no_notes else make_notes(transcript)
+
+    out = outdir / f"{slugify(meta['title'])}-{meta['id']}.md"
+    out.write_text(build_md(meta, source, transcript, notes), encoding="utf-8")
+    info(f"wrote {out}")
+    print(out)
+
+
+if __name__ == "__main__":
+    main()
