@@ -4,7 +4,7 @@
 export YTNOTE_DIR="${YTNOTE_DIR:-$HOME/Notes/youtube}"
 
 ytnote() {
-  command /home/mikekey/Tools/youtube-notetaker/ytnote "$@"
+  command /home/mikekey/Tools/YTNote/ytnote "$@"
 }
 alias ytn='ytnote'
 alias ytnt='ytnote --no-notes'   # transcript only
