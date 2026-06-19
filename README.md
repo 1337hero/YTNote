@@ -42,7 +42,7 @@ sudo pacman -S yt-dlp ffmpeg python
 ## Install
 
 ```sh
-git clone https://github.com/<you>/YTNote.git
+git clone https://github.com/1337hero/YTNote.git
 cd YTNote
 chmod +x ytnote
 ```
